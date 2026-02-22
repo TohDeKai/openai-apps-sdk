@@ -1,0 +1,231 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Pomodoro Timer</title>
+    <style>
+      :root {
+        color: #0b0b0f;
+        font-family:
+          "Inter",
+          system-ui,
+          -apple-system,
+          sans-serif;
+      }
+
+      body {
+        margin: 0;
+        padding: 16px;
+        background: #f6f8fb;
+      }
+
+      main {
+        width: 100%;
+        max-width: 480px;
+        margin: 0 auto;
+        background: #fff;
+        border-radius: 16px;
+        padding: 24px;
+        display: flex;
+        flex-direction: column;
+        gap: 16px;
+      }
+
+      h2 {
+        margin: 0;
+        font-size: 1.25rem;
+      }
+
+      .time-display {
+        font-size: 2.5rem;
+        font-weight: 700;
+        text-align: center;
+        letter-spacing: 2px;
+      }
+
+      .controls,
+      .edit-controls {
+        display: flex;
+        gap: 8px;
+      }
+
+      input {
+        flex: 1;
+        padding: 10px 12px;
+        border-radius: 10px;
+        border: 1px solid #cad3e0;
+        font-size: 0.95rem;
+      }
+
+      button {
+        border: none;
+        border-radius: 10px;
+        background: #e70b0b;
+        color: white;
+        font-weight: 600;
+        padding: 10px 14px;
+        cursor: pointer;
+      }
+
+      button.secondary {
+        background: #6c768a;
+      }
+
+      button:disabled {
+        opacity: 0.7;
+        cursor: not-allowed;
+      }
+
+      .status {
+        text-align: center;
+        font-size: 0.9rem;
+        color: #6c768a;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h2>De Kai's Pomodoro Timer</h2>
+
+      <div class="time-display" id="time-display">00:00</div>
+      <div class="status" id="status">Stopped</div>
+
+      <div class="controls">
+        <input type="number" id="minutes" placeholder="Minutes" min="0" />
+        <input type="number" id="seconds" placeholder="Seconds" min="0" />
+      </div>
+
+      <div class="controls">
+        <button id="start-btn">Start</button>
+        <button id="stop-btn" class="secondary">Stop</button>
+      </div>
+
+      <div class="edit-controls">
+        <button id="edit-btn">Edit Duration</button>
+      </div>
+    </main>
+
+    <script type="module">
+      const timeDisplay = document.getElementById("time-display");
+      const statusEl = document.getElementById("status");
+      const minutesInput = document.getElementById("minutes");
+      const secondsInput = document.getElementById("seconds");
+      const startBtn = document.getElementById("start-btn");
+      const stopBtn = document.getElementById("stop-btn");
+      const editBtn = document.getElementById("edit-btn");
+
+      let timerState = {
+        isRunning: false,
+        remainingMs: 0,
+      };
+
+      /* ---------------------------
+         Rendering
+      ---------------------------- */
+
+      const formatTime = (ms) => {
+        const totalSeconds = Math.ceil(ms / 1000);
+        const minutes = Math.floor(totalSeconds / 60);
+        const seconds = totalSeconds % 60;
+        return `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+      };
+
+      const render = () => {
+        timeDisplay.textContent = formatTime(timerState.remainingMs);
+        statusEl.textContent = timerState.isRunning ? "Running" : "Stopped";
+      };
+
+      const updateFromResponse = (response) => {
+        const data = response?.structuredContent;
+        if (!data) return;
+
+        timerState.isRunning = Boolean(data.isRunning);
+        timerState.remainingMs = data.remainingMs ?? 0;
+        render();
+      };
+
+      /* ---------------------------
+         MCP Bridge
+      ---------------------------- */
+
+      let rpcId = 0;
+      const pendingRequests = new Map();
+
+      const rpcNotify = (method, params) => {
+        window.parent.postMessage({ jsonrpc: "2.0", method, params }, "*");
+      };
+
+      const rpcRequest = (method, params) =>
+        new Promise((resolve, reject) => {
+          const id = ++rpcId;
+          pendingRequests.set(id, { resolve, reject });
+          window.parent.postMessage(
+            { jsonrpc: "2.0", id, method, params },
+            "*",
+          );
+        });
+
+      window.addEventListener("message", (event) => {
+        if (event.source !== window.parent) return;
+        const message = event.data;
+        if (!message || message.jsonrpc !== "2.0") return;
+
+        if (typeof message.id === "number") {
+          const pending = pendingRequests.get(message.id);
+          if (!pending) return;
+          pendingRequests.delete(message.id);
+          message.error
+            ? pending.reject(message.error)
+            : pending.resolve(message.result);
+          return;
+        }
+
+        if (message.method === "ui/notifications/tool-result") {
+          updateFromResponse(message.params);
+        }
+      });
+
+      const initializeBridge = async () => {
+        await rpcRequest("ui/initialize", {
+          appInfo: { name: "pomodoro-widget", version: "0.1.0" },
+          appCapabilities: {},
+          protocolVersion: "2026-01-26",
+        });
+        rpcNotify("ui/notifications/initialized", {});
+      };
+
+      const bridgeReady = initializeBridge();
+
+      const callTool = async (name, payload = {}) => {
+        await bridgeReady;
+        const response = await rpcRequest("tools/call", {
+          name,
+          arguments: payload,
+        });
+        updateFromResponse(response);
+      };
+
+      /* ---------------------------
+         Event Handlers
+      ---------------------------- */
+
+      startBtn.addEventListener("click", async () => {
+        const minutes = Number(minutesInput.value || 0);
+        const seconds = Number(secondsInput.value || 0);
+        await callTool("start_timer", { minutes, seconds });
+      });
+
+      stopBtn.addEventListener("click", async () => {
+        await callTool("stop_timer");
+      });
+
+      editBtn.addEventListener("click", async () => {
+        const minutes = Number(minutesInput.value || 0);
+        const seconds = Number(secondsInput.value || 0);
+        await callTool("edit_timer", { minutes, seconds });
+      });
+
+      render();
+    </script>
+  </body>
+</html>

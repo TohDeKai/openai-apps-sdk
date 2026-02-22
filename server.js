@@ -1,97 +1,242 @@
 import { createServer } from "node:http";
 import { readFileSync } from "node:fs";
+import {
+  registerAppResource,
+  registerAppTool,
+  RESOURCE_MIME_TYPE,
+} from "@modelcontextprotocol/ext-apps/server";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
 
-const todoHtml = readFileSync("public/todo-widget.html", "utf8");
+const pomodoroHtml = readFileSync("public/pomodoro-widget.html", "utf8");
 
-const addTodoInputSchema = {
-  title: z.string().min(1),
+/* ---------------------------
+   Schemas
+---------------------------- */
+
+const startTimerSchema = {
+  minutes: z.number().int().nonnegative().optional(),
+  seconds: z.number().int().nonnegative().optional(),
 };
 
-const completeTodoInputSchema = {
-  id: z.string().min(1),
+const editTimerSchema = startTimerSchema;
+
+/* ---------------------------
+   Timer State (in-memory)
+---------------------------- */
+
+let timer = {
+  durationMs: 0,
+  remainingMs: 0,
+  startedAt: null,
+  isRunning: false,
+  timeoutRef: null,
 };
 
-let todos = [];
-let nextId = 1;
+/* ---------------------------
+   Helpers
+---------------------------- */
 
-const replyWithTodos = (message) => ({
-  content: message ? [{ type: "text", text: message }] : [],
-  structuredContent: { tasks: todos },
-});
+function computeRemaining() {
+  if (!timer.isRunning || !timer.startedAt) {
+    return timer.remainingMs;
+  }
 
-function createTodoServer() {
-  const server = new McpServer({ name: "todo-app", version: "0.1.0" });
+  const elapsed = Date.now() - timer.startedAt;
+  return Math.max(timer.durationMs - elapsed, 0);
+}
 
-  server.registerResource(
-    "todo-widget",
-    "ui://widget/todo.html",
+function replyWithTimer(message) {
+  const remainingMs = computeRemaining();
+
+  return {
+    content: message ? [{ type: "text", text: message }] : [],
+    structuredContent: {
+      isRunning: timer.isRunning,
+      durationMs: timer.durationMs,
+      remainingMs,
+      remainingSeconds: Math.ceil(remainingMs / 1000),
+    },
+  };
+}
+
+/* ---------------------------
+   MCP Server
+---------------------------- */
+
+function createPomodoroServer() {
+  const server = new McpServer({
+    name: "pomodoro-app",
+    version: "0.1.0",
+  });
+
+  registerAppResource(
+    server,
+    "pomodoro-widget",
+    "ui://widget/pomodoro.html",
     {},
     async () => ({
       contents: [
         {
-          uri: "ui://widget/todo.html",
-          mimeType: "text/html+skybridge",
-          text: todoHtml,
-          _meta: { "openai/widgetPrefersBorder": true },
+          uri: "ui://widget/pomodoro.html",
+          mimeType: RESOURCE_MIME_TYPE,
+          text: pomodoroHtml,
         },
       ],
-    })
+    }),
   );
 
-  server.registerTool(
-    "add_todo",
+  /* ---------------------------
+     Start Timer
+  ---------------------------- */
+
+  registerAppTool(
+    server,
+    "start_timer",
     {
-      title: "Add todo",
-      description: "Creates a todo item with the given title.",
-      inputSchema: addTodoInputSchema,
+      title: "Start timer",
+      description: "Starts a Pomodoro timer with minutes or seconds.",
+      inputSchema: startTimerSchema,
       _meta: {
-        "openai/outputTemplate": "ui://widget/todo.html",
-        "openai/toolInvocation/invoking": "Adding todo",
-        "openai/toolInvocation/invoked": "Added todo",
+        ui: { resourceUri: "ui://widget/pomodoro.html" },
       },
     },
     async (args) => {
-      const title = args?.title?.trim?.() ?? "";
-      if (!title) return replyWithTodos("Missing title.");
-      const todo = { id: `todo-${nextId++}`, title, completed: false };
-      todos = [...todos, todo];
-      return replyWithTodos(`Added "${todo.title}".`);
-    }
-  );
+      const minutes = args?.minutes ?? 0;
+      const seconds = args?.seconds ?? 0;
 
-  server.registerTool(
-    "complete_todo",
-    {
-      title: "Complete todo",
-      description: "Marks a todo as done by id.",
-      inputSchema: completeTodoInputSchema,
-      _meta: {
-        "openai/outputTemplate": "ui://widget/todo.html",
-        "openai/toolInvocation/invoking": "Completing todo",
-        "openai/toolInvocation/invoked": "Completed todo",
-      },
-    },
-    async (args) => {
-      const id = args?.id;
-      if (!id) return replyWithTodos("Missing todo id.");
-      const todo = todos.find((task) => task.id === id);
-      if (!todo) {
-        return replyWithTodos(`Todo ${id} was not found.`);
+      const durationMs = minutes * 60000 + seconds * 1000;
+
+      if (durationMs <= 0) {
+        return replyWithTimer("Provide a duration greater than 0.");
       }
 
-      todos = todos.map((task) =>
-        task.id === id ? { ...task, completed: true } : task
-      );
+      if (timer.timeoutRef) {
+        clearTimeout(timer.timeoutRef);
+      }
 
-      return replyWithTodos(`Completed "${todo.title}".`);
-    }
+      timer.durationMs = durationMs;
+      timer.remainingMs = durationMs;
+      timer.startedAt = Date.now();
+      timer.isRunning = true;
+
+      timer.timeoutRef = setTimeout(() => {
+        timer.isRunning = false;
+        timer.remainingMs = 0;
+        timer.startedAt = null;
+        timer.timeoutRef = null;
+        console.log("Pomodoro complete.");
+      }, durationMs);
+
+      return replyWithTimer("Timer started.");
+    },
+  );
+
+  /* ---------------------------
+     Stop Timer
+  ---------------------------- */
+
+  registerAppTool(
+    server,
+    "stop_timer",
+    {
+      title: "Stop timer",
+      description: "Stops the current timer.",
+      inputSchema: {},
+      _meta: {
+        ui: { resourceUri: "ui://widget/pomodoro.html" },
+      },
+    },
+    async () => {
+      if (!timer.isRunning) {
+        return replyWithTimer("Timer is not running.");
+      }
+
+      const remaining = computeRemaining();
+
+      clearTimeout(timer.timeoutRef);
+
+      timer.remainingMs = remaining;
+      timer.isRunning = false;
+      timer.startedAt = null;
+      timer.timeoutRef = null;
+
+      return replyWithTimer("Timer stopped.");
+    },
+  );
+
+  /* ---------------------------
+     Edit Timer
+  ---------------------------- */
+
+  registerAppTool(
+    server,
+    "edit_timer",
+    {
+      title: "Edit timer",
+      description: "Changes the timer duration.",
+      inputSchema: editTimerSchema,
+      _meta: {
+        ui: { resourceUri: "ui://widget/pomodoro.html" },
+      },
+    },
+    async (args) => {
+      const minutes = args?.minutes ?? 0;
+      const seconds = args?.seconds ?? 0;
+
+      const newDurationMs = minutes * 60000 + seconds * 1000;
+
+      if (newDurationMs <= 0) {
+        return replyWithTimer("Provide a duration greater than 0.");
+      }
+
+      if (timer.timeoutRef) {
+        clearTimeout(timer.timeoutRef);
+      }
+
+      timer.durationMs = newDurationMs;
+      timer.remainingMs = newDurationMs;
+      timer.startedAt = timer.isRunning ? Date.now() : null;
+
+      if (timer.isRunning) {
+        timer.timeoutRef = setTimeout(() => {
+          timer.isRunning = false;
+          timer.remainingMs = 0;
+          timer.startedAt = null;
+          timer.timeoutRef = null;
+          console.log("Pomodoro complete.");
+        }, newDurationMs);
+      }
+
+      return replyWithTimer("Timer updated.");
+    },
+  );
+
+  /* ---------------------------
+     Get Timer State
+  ---------------------------- */
+
+  registerAppTool(
+    server,
+    "get_timer",
+    {
+      title: "Get timer",
+      description: "Returns the current timer state.",
+      inputSchema: {},
+      _meta: {
+        ui: { resourceUri: "ui://widget/pomodoro.html" },
+      },
+    },
+    async () => replyWithTimer(),
   );
 
   return server;
 }
+
+/* ---------------------------
+   HTTP Server (unchanged structure)
+---------------------------- */
 
 const port = Number(process.env.PORT ?? 8787);
 const MCP_PATH = "/mcp";
@@ -116,7 +261,9 @@ const httpServer = createServer(async (req, res) => {
   }
 
   if (req.method === "GET" && url.pathname === "/") {
-    res.writeHead(200, { "content-type": "text/plain" }).end("Todo MCP server");
+    res
+      .writeHead(200, { "content-type": "text/plain" })
+      .end("Pomodoro MCP server");
     return;
   }
 
@@ -125,9 +272,9 @@ const httpServer = createServer(async (req, res) => {
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader("Access-Control-Expose-Headers", "Mcp-Session-Id");
 
-    const server = createTodoServer();
+    const server = createPomodoroServer();
     const transport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: undefined, // stateless mode
+      sessionIdGenerator: undefined,
       enableJsonResponse: true,
     });
 
@@ -153,6 +300,6 @@ const httpServer = createServer(async (req, res) => {
 
 httpServer.listen(port, () => {
   console.log(
-    `Todo MCP server listening on http://localhost:${port}${MCP_PATH}`
+    `Pomodoro MCP server listening on http://localhost:${port}${MCP_PATH}`,
   );
 });
