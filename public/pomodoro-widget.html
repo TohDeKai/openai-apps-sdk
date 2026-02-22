@@ -85,7 +85,7 @@
   </head>
   <body>
     <main>
-      <h2>De Kai's Pomodoro Timer</h2>
+      <h2>De Kai's Pomodoro Timer (V2)</h2>
 
       <div class="time-display" id="time-display">00:00</div>
       <div class="status" id="status">Stopped</div>
@@ -103,6 +103,13 @@
       <div class="edit-controls">
         <button id="edit-btn">Edit Duration</button>
       </div>
+
+      <!-- Hidden audio alert -->
+      <audio
+        id="alert-sound"
+        src="https://actions.google.com/sounds/v1/alarms/alarm_clock.ogg"
+        preload="auto"
+      ></audio>
     </main>
 
     <script type="module">
@@ -113,15 +120,14 @@
       const startBtn = document.getElementById("start-btn");
       const stopBtn = document.getElementById("stop-btn");
       const editBtn = document.getElementById("edit-btn");
+      const alertSound = document.getElementById("alert-sound");
 
       let timerState = {
         isRunning: false,
         remainingMs: 0,
       };
 
-      /* ---------------------------
-         Rendering
-      ---------------------------- */
+      let tickInterval = null;
 
       const formatTime = (ms) => {
         const totalSeconds = Math.ceil(ms / 1000);
@@ -142,6 +148,28 @@
         timerState.isRunning = Boolean(data.isRunning);
         timerState.remainingMs = data.remainingMs ?? 0;
         render();
+
+        if (timerState.isRunning && !tickInterval) {
+          tickInterval = setInterval(() => {
+            timerState.remainingMs -= 1000;
+            if (timerState.remainingMs <= 0) {
+              timerState.remainingMs = 0;
+              timerState.isRunning = false;
+              clearInterval(tickInterval);
+              tickInterval = null;
+              // Play sound
+              alertSound.play().catch(() => {});
+              // Optional: browser notification
+              if (Notification.permission === "granted") {
+                new Notification("Pomodoro Complete!");
+              }
+            }
+            render();
+          }, 1000);
+        } else if (!timerState.isRunning && tickInterval) {
+          clearInterval(tickInterval);
+          tickInterval = null;
+        }
       };
 
       /* ---------------------------
@@ -224,6 +252,11 @@
         const seconds = Number(secondsInput.value || 0);
         await callTool("edit_timer", { minutes, seconds });
       });
+
+      // Ask notification permission
+      if (Notification.permission !== "granted") {
+        Notification.requestPermission();
+      }
 
       render();
     </script>
